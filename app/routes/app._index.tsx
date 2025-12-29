@@ -5,7 +5,7 @@ import type {
 import { useLoaderData, useNavigate } from "react-router";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
-import { getVendorForStaff } from "../config/vendorStaffMapping";
+import { getVendorForStaff, getAllVendors } from "../config/vendorStaffMapping";
 import {
   Page,
   Layout,
@@ -15,6 +15,9 @@ import {
   Badge,
   Pagination,
   EmptyState,
+  Select,
+  Card,
+  BlockStack,
 } from "@shopify/polaris";
 
 interface Order {
@@ -25,33 +28,34 @@ interface Order {
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin, session  } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
   const after = url.searchParams.get("after");
   const before = url.searchParams.get("before");
-
-  // Log all session information for debugging
-  console.log("=== SESSION DEBUG INFO ===");
-  console.log("Full Session Object:", JSON.stringify(session, null, 2));
-  console.log("Session Shop:", session.shop);
-  console.log("Session ID:", session.id);
-  console.log("Session Online Access Info:", session.onlineAccessInfo);
-  
-  // Try to get user email from different possible locations
-  const userEmail = session.onlineAccessInfo?.associated_user?.email || null;
-  console.log("User Email:", userEmail);
-  console.log("Associated User:", session.onlineAccessInfo?.associated_user);
-  console.log("========================");
+  const selectedVendor = url.searchParams.get("vendor");
 
   // Determine pagination direction
-  const paginationArgs = before 
-    ? { last: 10, before } 
+  const paginationArgs: any = before
+    ? { last: 10, before }
     : { first: 10, after };
+
+  // 1. Identify User & Effective Vendor
+  const userEmail = session.onlineAccessInfo?.associated_user?.email || null;
+  const assignedVendor = userEmail ? getVendorForStaff(userEmail) : null;
+  
+  // If user is assigned to a vendor, FORCE that vendor.
+  // If user is Admin (assignedVendor is null), allow them to select a vendor via query param.
+  const effectiveVendor = assignedVendor || selectedVendor;
+
+  // 2. Prepare GraphQL Query Variables
+  if (effectiveVendor) {
+    paginationArgs.query = `vendor:"${effectiveVendor}"`;
+  }
 
   const response = await admin.graphql(
     `#graphql
-    query GetOrders($first: Int, $after: String, $last: Int, $before: String) {
-      orders(first: $first, after: $after, last: $last, before: $before, sortKey: CREATED_AT, reverse: true) {
+    query GetOrders($first: Int, $after: String, $last: Int, $before: String, $query: String) {
+      orders(first: $first, after: $after, last: $last, before: $before, sortKey: CREATED_AT, reverse: true, query: $query) {
         pageInfo {
           hasNextPage
           hasPreviousPage
@@ -89,74 +93,90 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   );
 
   const responseJson = (await response.json()) as any;
-  
+
   if (responseJson.errors) {
     console.error("GraphQL Errors:", responseJson.errors);
-    throw new Error("Failed to fetch orders. Check terminal for details.");
+    throw new Error("Failed to fetch orders.");
   }
 
-  // Get vendor assignment for current user
-  const assignedVendor = userEmail ? getVendorForStaff(userEmail) : null;
-  console.log("Assigned Vendor:", assignedVendor);
-
-  // Process orders and filter by vendor if applicable
   const allOrders = responseJson.data.orders.edges;
+
+  // 3. Process & Filter Orders (Strict Isolation)
+  // Even though we queried by vendor, we must filter LINE ITEMS to ensuring
+  // we don't show items from other vendors that happen to be in the same order.
   
   let filteredOrders: Order[];
-  
-  if (assignedVendor) {
-    // Vendor staff: only show orders that contain their vendor's products
-    filteredOrders = allOrders
+
+  if (effectiveVendor) {
+     filteredOrders = allOrders
       .map((edge: any) => {
-        // Filter line items to only include this vendor's products
         const vendorLineItems = edge.node.lineItems.edges.filter((lineItemEdge: any) => {
           const vendor = lineItemEdge.node.variant?.product?.vendor;
-          return vendor === assignedVendor;
+          return vendor === effectiveVendor;
         });
 
-        // Only include the order if it has line items from this vendor
         if (vendorLineItems.length > 0) {
           return {
             id: edge.node.id,
             name: edge.node.name,
             financialStatus: edge.node.displayFinancialStatus,
-            itemCount: vendorLineItems.length, // Count only vendor's items
+            itemCount: vendorLineItems.length,
           };
         }
         return null;
       })
       .filter((order: Order | null) => order !== null) as Order[];
-    
-    console.log(`Filtered to ${filteredOrders.length} orders for vendor: ${assignedVendor}`);
   } else {
-    // Admin/Owner: show all orders
+    // Admin View (No specific vendor selected): Show everything
     filteredOrders = allOrders.map((edge: any) => ({
       id: edge.node.id,
       name: edge.node.name,
       financialStatus: edge.node.displayFinancialStatus,
       itemCount: edge.node.lineItems.edges.length,
     }));
-    
-    console.log(`Showing all ${filteredOrders.length} orders (Admin/Owner view)`);
   }
 
   return {
     orders: filteredOrders,
     pageInfo: responseJson.data.orders.pageInfo,
+    user: {
+      email: userEmail,
+      isVendor: !!assignedVendor,
+      assignedVendor,
+    },
+    meta: {
+      availableVendors: !assignedVendor ? getAllVendors() : [], // Only send list if Admin
+      currentVendor: effectiveVendor,
+    }
   };
 };
 
 export default function Index() {
-  const { orders, pageInfo } = useLoaderData<typeof loader>();
+  const { orders, pageInfo, user, meta } = useLoaderData<typeof loader>();
   const navigate = useNavigate();
 
   const handlePagination = (direction: "next" | "prev") => {
-    const params = new URLSearchParams();
+    const params = new URLSearchParams(window.location.search);
     if (direction === "next" && pageInfo.endCursor) {
       params.set("after", pageInfo.endCursor);
+      params.delete("before");
     } else if (direction === "prev" && pageInfo.startCursor) {
       params.set("before", pageInfo.startCursor);
+      params.delete("after");
     }
+    navigate(`?${params.toString()}`);
+  };
+
+  const handleVendorChange = (newVendor: string) => {
+    const params = new URLSearchParams(window.location.search);
+    if (newVendor) {
+      params.set("vendor", newVendor);
+    } else {
+      params.delete("vendor");
+    }
+    // Reset pagination when filter changes
+    params.delete("after");
+    params.delete("before");
     navigate(`?${params.toString()}`);
   };
 
@@ -192,11 +212,34 @@ export default function Index() {
   return (
     <Page title="Orders">
       <Layout>
+        {/* Admin Vendor Filter */}
+        {!user.isVendor && meta.availableVendors.length > 0 && (
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="200">
+                <Text as="h2" variant="headingSm">
+                  Filter by Vendor (Admin Only)
+                </Text>
+                <Select
+                  label="Select Vendor"
+                  labelHidden
+                  options={[
+                    { label: "All Vendors", value: "" },
+                    ...meta.availableVendors.map((v) => ({ label: v, value: v })),
+                  ]}
+                  value={meta.currentVendor || ""}
+                  onChange={handleVendorChange}
+                />
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        )}
+
         <Layout.Section>
           <LegacyCard>
             {orders.length === 0 ? (
               <EmptyState
-                heading="No orders found"
+                heading={meta.currentVendor ? `No orders for ${meta.currentVendor}` : "No orders found"}
                 image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
               >
                 <p>Make sure you have orders in your Shopify store.</p>

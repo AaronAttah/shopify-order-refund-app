@@ -15,7 +15,7 @@ export const VENDOR_STAFF_MAPPING: VendorStaffMapping = {
   "vendor2@example.com": "Acme Supplies",
   "test-vendor@example.com": "Test Vendor",
   "ojzeeaaron@gmail.com": "Hydrogen Vendor",
-  // Add your test staff email here:
+  // Add your test staff email here:clear
   // "your-staff-email@example.com": "Your Vendor Name",
 };
 
