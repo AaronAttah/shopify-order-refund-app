@@ -5,6 +5,17 @@ import type {
 import { useLoaderData, useNavigate } from "react-router";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
+import { getVendorForStaff } from "../config/vendorStaffMapping";
+import {
+  Page,
+  Layout,
+  LegacyCard,
+  IndexTable,
+  Text,
+  Badge,
+  Pagination,
+  EmptyState,
+} from "@shopify/polaris";
 
 interface Order {
   id: string;
@@ -14,10 +25,23 @@ interface Order {
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session  } = await authenticate.admin(request);
   const url = new URL(request.url);
   const after = url.searchParams.get("after");
   const before = url.searchParams.get("before");
+
+  // Log all session information for debugging
+  console.log("=== SESSION DEBUG INFO ===");
+  console.log("Full Session Object:", JSON.stringify(session, null, 2));
+  console.log("Session Shop:", session.shop);
+  console.log("Session ID:", session.id);
+  console.log("Session Online Access Info:", session.onlineAccessInfo);
+  
+  // Try to get user email from different possible locations
+  const userEmail = session.onlineAccessInfo?.associated_user?.email || null;
+  console.log("User Email:", userEmail);
+  console.log("Associated User:", session.onlineAccessInfo?.associated_user);
+  console.log("========================");
 
   // Determine pagination direction
   const paginationArgs = before 
@@ -43,6 +67,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
               edges {
                 node {
                   id
+                  title
+                  quantity
+                  variant {
+                    id
+                    product {
+                      id
+                      vendor
+                    }
+                  }
                 }
               }
             }
@@ -62,15 +95,53 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     throw new Error("Failed to fetch orders. Check terminal for details.");
   }
 
-  const orders: Order[] = responseJson.data.orders.edges.map((edge: any) => ({
-    id: edge.node.id,
-    name: edge.node.name,
-    financialStatus: edge.node.displayFinancialStatus,
-    itemCount: edge.node.lineItems.edges.length,
-  }));
+  // Get vendor assignment for current user
+  const assignedVendor = userEmail ? getVendorForStaff(userEmail) : null;
+  console.log("Assigned Vendor:", assignedVendor);
+
+  // Process orders and filter by vendor if applicable
+  const allOrders = responseJson.data.orders.edges;
+  
+  let filteredOrders: Order[];
+  
+  if (assignedVendor) {
+    // Vendor staff: only show orders that contain their vendor's products
+    filteredOrders = allOrders
+      .map((edge: any) => {
+        // Filter line items to only include this vendor's products
+        const vendorLineItems = edge.node.lineItems.edges.filter((lineItemEdge: any) => {
+          const vendor = lineItemEdge.node.variant?.product?.vendor;
+          return vendor === assignedVendor;
+        });
+
+        // Only include the order if it has line items from this vendor
+        if (vendorLineItems.length > 0) {
+          return {
+            id: edge.node.id,
+            name: edge.node.name,
+            financialStatus: edge.node.displayFinancialStatus,
+            itemCount: vendorLineItems.length, // Count only vendor's items
+          };
+        }
+        return null;
+      })
+      .filter((order: Order | null) => order !== null) as Order[];
+    
+    console.log(`Filtered to ${filteredOrders.length} orders for vendor: ${assignedVendor}`);
+  } else {
+    // Admin/Owner: show all orders
+    filteredOrders = allOrders.map((edge: any) => ({
+      id: edge.node.id,
+      name: edge.node.name,
+      financialStatus: edge.node.displayFinancialStatus,
+      itemCount: edge.node.lineItems.edges.length,
+    }));
+    
+    console.log(`Showing all ${filteredOrders.length} orders (Admin/Owner view)`);
+  }
 
   return {
-    orders,
+    orders: filteredOrders,
     pageInfo: responseJson.data.orders.pageInfo,
   };
 };
@@ -81,7 +152,6 @@ export default function Index() {
 
   const handlePagination = (direction: "next" | "prev") => {
     const params = new URLSearchParams();
-    console.log("PageInfo:", pageInfo);
     if (direction === "next" && pageInfo.endCursor) {
       params.set("after", pageInfo.endCursor);
     } else if (direction === "prev" && pageInfo.startCursor) {
@@ -90,123 +160,82 @@ export default function Index() {
     navigate(`?${params.toString()}`);
   };
 
-  console.log("Orders data:", orders);
-  console.log("Orders length:", orders.length);
+  const resourceName = {
+    singular: "order",
+    plural: "orders",
+  };
+
+  const rowMarkup = orders.map(
+    ({ id, name, financialStatus, itemCount }, index) => (
+      <IndexTable.Row id={id} key={id} position={index}>
+        <IndexTable.Cell>
+          <Text variant="bodyMd" fontWeight="bold" as="span">
+            {name}
+          </Text>
+        </IndexTable.Cell>
+        <IndexTable.Cell>
+          <Badge tone={financialStatus === "PAID" ? "success" : "info"}>
+            {financialStatus}
+          </Badge>
+        </IndexTable.Cell>
+        <IndexTable.Cell>
+          <div style={{ textAlign: "right" }}>
+            <Text as="span" numeric>
+              {itemCount}
+            </Text>
+          </div>
+        </IndexTable.Cell>
+      </IndexTable.Row>
+    )
+  );
 
   return (
-    <s-page heading="Orders">
-      <s-section>
-        {orders.length === 0 ? (
-          <div style={{ padding: "20px", textAlign: "center" }}>
-            <p>No orders found. Make sure you have orders in your Shopify store.</p>
-          </div>
-        ) : (
-          <div>
-            <table style={{ 
-              width: "100%", 
-              borderCollapse: "collapse",
-              backgroundColor: "white",
-              border: "1px solid #e1e3e5"
-            }}>
-              <thead>
-                <tr style={{ borderBottom: "2px solid #e1e3e5" }}>
-                  <th style={{ 
-                    padding: "12px 16px", 
-                    textAlign: "left",
-                    fontWeight: 600,
-                    fontSize: "14px"
-                  }}>Order</th>
-                  <th style={{ 
-                    padding: "12px 16px", 
-                    textAlign: "left",
-                    fontWeight: 600,
-                    fontSize: "14px"
-                  }}>Financial Status</th>
-                  <th style={{ 
-                    padding: "12px 16px", 
-                    textAlign: "right",
-                    fontWeight: 600,
-                    fontSize: "14px"
-                  }}>Items</th>
-                </tr>
-              </thead>
-              <tbody>
-                {orders.map((order) => (
-                  <tr key={order.id} style={{ borderBottom: "1px solid #e1e3e5" }}>
-                    <td style={{ 
-                      padding: "12px 16px",
-                      fontWeight: 600,
-                      fontSize: "14px"
-                    }}>
-                      {order.name}
-                    </td>
-                    <td style={{ padding: "12px 16px" }}>
-                      <span style={{
-                        display: "inline-block",
-                        padding: "4px 12px",
-                        borderRadius: "4px",
-                        fontSize: "12px",
-                        fontWeight: 500,
-                        backgroundColor: order.financialStatus === "PAID" ? "#3be36bff" : "#e0f0ff",
-                        color: order.financialStatus === "PAID" ? "#00801eff" : "#0066cc"
-                      }}>
-                        {order.financialStatus}
-                      </span>
-                    </td>
-                    <td style={{ 
-                      padding: "12px 16px", 
-                      textAlign: "right",
-                      fontSize: "14px"
-                    }}>
-                      {order.itemCount}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <div style={{ 
-              marginTop: "16px", 
-              display: "flex", 
-              justifyContent: "center", 
-              gap: "8px" 
-            }}>
-              <button
-                disabled={!pageInfo.hasPreviousPage}
-                onClick={() => handlePagination("prev")}
-                style={{
-                  padding: "8px 16px",
-                  backgroundColor: pageInfo.hasPreviousPage ? "#008060" : "#e1e3e5",
-                  color: pageInfo.hasPreviousPage ? "white" : "#6d7175",
-                  border: "none",
-                  borderRadius: "4px",
-                  cursor: pageInfo.hasPreviousPage ? "pointer" : "not-allowed",
-                  fontWeight: 500,
-                  fontSize: "14px"
-                }}
+    <Page title="Orders">
+      <Layout>
+        <Layout.Section>
+          <LegacyCard>
+            {orders.length === 0 ? (
+              <EmptyState
+                heading="No orders found"
+                image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
               >
-                Previous
-              </button>
-              <button
-                disabled={!pageInfo.hasNextPage}
-                onClick={() => handlePagination("next")}
-                style={{
-                  padding: "8px 16px",
-                  backgroundColor: pageInfo.hasNextPage ? "#008060" : "#e1e3e5",
-                  color: pageInfo.hasNextPage ? "white" : "#6d7175",
-                  border: "none",
-                  borderRadius: "4px",
-                  cursor: pageInfo.hasNextPage ? "pointer" : "not-allowed",
-                  fontWeight: 500,
-                  fontSize: "14px"
-                }}
-              >
-                Next
-              </button>
-            </div>
-          </div>
-        )}
-      </s-section>
-    </s-page>
+                <p>Make sure you have orders in your Shopify store.</p>
+              </EmptyState>
+            ) : (
+              <>
+                <IndexTable
+                  resourceName={resourceName}
+                  itemCount={orders.length}
+                  headings={[
+                    { title: "Order" },
+                    { title: "Financial Status" },
+                    { title: "Items", alignment: "end" },
+                  ]}
+                  selectable={false}
+                >
+                  {rowMarkup}
+                </IndexTable>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "center",
+                    padding: "16px",
+                    borderTop: "1px solid #dfe3e8",
+                  }}
+                >
+                  <Pagination
+                    hasPrevious={pageInfo.hasPreviousPage}
+                    onPrevious={() => handlePagination("prev")}
+                    hasNext={pageInfo.hasNextPage}
+                    onNext={() => handlePagination("next")}
+                  />
+                </div>
+              </>
+            )}
+          </LegacyCard>
+        </Layout.Section>
+      </Layout>
+    </Page>
   );
 }
 
