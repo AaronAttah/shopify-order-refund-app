@@ -2,7 +2,7 @@ import type {
   HeadersFunction,
   LoaderFunctionArgs,
 } from "react-router";
-import { useLoaderData, useNavigate } from "react-router";
+import { useLoaderData, useNavigate, Link } from "react-router";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { getVendorForStaff, getAllVendors } from "../config/vendorStaffMapping";
@@ -186,27 +186,35 @@ export default function Index() {
   };
 
   const rowMarkup = orders.map(
-    ({ id, name, financialStatus, itemCount }, index) => (
-      <IndexTable.Row id={id} key={id} position={index}>
-        <IndexTable.Cell>
-          <Text variant="bodyMd" fontWeight="bold" as="span">
-            {name}
-          </Text>
-        </IndexTable.Cell>
-        <IndexTable.Cell>
-          <Badge tone={financialStatus === "PAID" ? "success" : "info"}>
-            {financialStatus}
-          </Badge>
-        </IndexTable.Cell>
-        <IndexTable.Cell>
-          <div style={{ textAlign: "right" }}>
-            <Text as="span" numeric>
-              {itemCount}
-            </Text>
-          </div>
-        </IndexTable.Cell>
-      </IndexTable.Row>
-    )
+    ({ id, name, financialStatus, itemCount }, index) => {
+        // Extract numeric ID from GID
+        const numericId = id.split("/").pop();
+        const detailUrl = `/app/orders/${numericId}${meta.currentVendor ? `?vendor=${meta.currentVendor}` : ''}`;
+        
+        return (
+            <IndexTable.Row id={id} key={id} position={index}>
+                <IndexTable.Cell>
+                <Link to={detailUrl} data-primary-link>
+                    <Text variant="bodyMd" fontWeight="bold" as="span">
+                        {name}
+                    </Text>
+                </Link>
+                </IndexTable.Cell>
+                <IndexTable.Cell>
+                <Badge tone={financialStatus === "PAID" ? "success" : "info"}>
+                    {financialStatus}
+                </Badge>
+                </IndexTable.Cell>
+                <IndexTable.Cell>
+                <div style={{ textAlign: "right" }}>
+                    <Text as="span" numeric>
+                    {itemCount}
+                    </Text>
+                </div>
+                </IndexTable.Cell>
+            </IndexTable.Row>
+        );
+    }
   );
 
   return (
