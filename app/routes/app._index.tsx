@@ -201,9 +201,14 @@ export default function Index() {
                 </Link>
                 </IndexTable.Cell>
                 <IndexTable.Cell>
-                <Badge tone={financialStatus === "PAID" ? "success" : "info"}>
+                  <Badge tone={
+                    financialStatus === "PAID" ? "success" : 
+                    financialStatus === "REFUNDED" ? "info" : 
+                    financialStatus === "PARTIALLY_REFUNDED" ? "warning" : 
+                    "attention" // Pending/Voided
+                  }>
                     {financialStatus}
-                </Badge>
+                  </Badge>
                 </IndexTable.Cell>
                 <IndexTable.Cell>
                 <div style={{ textAlign: "right" }}>

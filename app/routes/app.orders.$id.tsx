@@ -20,9 +20,153 @@ import {
 } from "@shopify/polaris";
 import { ImageIcon } from "@shopify/polaris-icons";
 import { getVendorForStaff } from "../config/vendorStaffMapping";
-import type { LoaderFunctionArgs } from "react-router";
+import { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useSubmit, useActionData, useNavigation } from "react-router";
+import { Banner } from "@shopify/polaris";
 
-// ... (loader function remains exactly the same) ...
+// --- Action: Handle Refund Execution ---
+export const action = async ({ request, params }: ActionFunctionArgs) => {
+  const { admin, session } = await authenticate.admin(request);
+  const formData = await request.formData();
+  
+  const refundStateRaw = formData.get("refundState") as string;
+  const reason = formData.get("reason") as string;
+  const orderId = `gid://shopify/Order/${params.id}`;
+
+  if (!refundStateRaw) {
+    return { status: "error", message: "No items selected for refund." };
+  }
+
+  const refundState = JSON.parse(refundStateRaw);
+  
+  // 1. Fetch Order again to validate permissions & ownership (Security)
+  // We cannot trust client-side data blindly.
+  const orderResponse = await admin.graphql(
+    `#graphql
+    query GetOrderForValidation($id: ID!) {
+      order(id: $id) {
+        id
+        lineItems(first: 50) {
+          edges {
+            node {
+              id
+              quantity
+              variant {
+                product {
+                  vendor
+                }
+              }
+            }
+          }
+        }
+      }
+    }`,
+    { variables: { id: orderId } }
+  );
+  
+  const orderJson = await orderResponse.json();
+  const order = (orderJson as any).data.order;
+
+  // 2. Determine Effective Vendor for Validation
+  const userEmail = session.onlineAccessInfo?.associated_user?.email || null;
+  const assignedVendor = userEmail ? getVendorForStaff(userEmail) : null;
+  
+  // 3. build RefundLineItems for Mutation
+  const refundLineItems: any[] = [];
+  
+  for (const [lineItemId, qty] of Object.entries(refundState)) {
+    // Find the original item
+    const lineItemNode = order.lineItems.edges.find((edge: any) => edge.node.id === lineItemId)?.node;
+    
+    if (!lineItemNode) {
+        return { status: "error", message: `Invalid line item: ${lineItemId}` };
+    }
+
+    // Check Vendor Ownership (If staff)
+    if (assignedVendor) {
+        const itemVendor = lineItemNode.variant?.product?.vendor;
+        if (itemVendor !== assignedVendor) {
+             return { status: "error", message: `Unauthorized: You cannot refund items from ${itemVendor}` };
+        }
+    }
+
+    // Check Quantity
+    if ((qty as number) > lineItemNode.quantity) {
+        return { status: "error", message: `Invalid quantity for item ${lineItemId}` };
+    }
+
+    refundLineItems.push({
+        lineItemId: lineItemId,
+        quantity: parseInt(qty as string, 10),
+    });
+  }
+
+  if (refundLineItems.length === 0) {
+      return { status: "error", message: "No valid items to refund." };
+  }
+
+  // 4. Calculate Refund Amount (Server-side)
+  // Since refundCalculate API is tricky with versions, we calculate the amount manually 
+  // to ensure we create a transaction that updates the Financial Status to REFUNDED.
+  let totalRefundAmount = 0;
+  
+  for (const item of refundLineItems) {
+      const lineItemNode = order.lineItems.edges.find((edge: any) => edge.node.id === item.lineItemId)?.node;
+      // We assume price is per unit.
+      if (lineItemNode) {
+         totalRefundAmount += parseFloat(lineItemNode.variant?.price || "0") * item.quantity;
+      }
+  }
+
+  // 5. Build Transactions Input
+  // We create a "manual" refund transaction for the calculated amount.
+  // This tells Shopify "We have returned $X to the customer".
+  const transactionsInput = [
+    {
+      kind: "REFUND",
+      orderId: orderId,
+      amount: totalRefundAmount.toFixed(2),
+      gateway: "manual", // Marks as manually refunded
+    }
+  ];
+
+  // 6. Execute Refund Mutation with Transactions
+  const mutationResponse = await admin.graphql(
+    `#graphql
+    mutation CreateRefund($input: RefundInput!) {
+      refundCreate(input: $input) {
+        refund {
+          id
+          note
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }`,
+    {
+      variables: {
+        input: {
+          orderId: orderId,
+          note: reason,
+          notify: true,
+          refundLineItems: refundLineItems,
+          transactions: transactionsInput,
+        },
+      },
+    }
+  );
+
+  const mutationJson = (await mutationResponse.json()) as any;
+  const result = mutationJson.data.refundCreate;
+
+  if (result.userErrors && result.userErrors.length > 0) {
+    return { status: "error", message: result.userErrors[0].message };
+  }
+
+  return { status: "success", message: "Refund processed successfully!" };
+};
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -53,6 +197,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
               id
               title
               quantity
+              refundableQuantity
               sku
               originalTotalSet {
                 shopMoney {
@@ -133,10 +278,34 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 export default function OrderDetails() {
   const { order, effectiveVendor, formattedTotal } = useLoaderData<typeof loader>();
   const navigate = useNavigate();
+  const submit = useSubmit();
+  const actionData = useActionData<typeof action>();
+  const navigation = useNavigation();
+  
+  const isLoading = navigation.state === "submitting";
 
   // State for Refund Draft
   const [refundState, setRefundState] = useState<Record<string, number>>({});
+  const [refundNote, setRefundNote] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
+
+  // Clear state on success
+  if (actionData?.status === "success" && modalOpen) {
+      setModalOpen(false);
+      setRefundState({});
+      setRefundNote("");
+  }
+
+  const handleRefundSubmit = () => {
+    const formData = new FormData();
+    formData.append("refundState", JSON.stringify(refundState));
+    formData.append("reason", refundNote);
+    
+    // Append vendor info for audit trail logic if needed, 
+    // but we use session info server-side for safety.
+    
+    submit(formData, { method: "post" });
+  };
 
   const handleQuantityChange = (id: string, value: string, max: number) => {
     const qty = parseInt(value, 10);
@@ -148,7 +317,7 @@ export default function OrderDetails() {
         });
         return;
     }
-    // Validation: cannot refund more than purchased
+    // Validation limits
     const validatedQty = Math.min(qty, max);
     setRefundState(prev => ({ ...prev, [id]: validatedQty }));
   };
@@ -173,8 +342,9 @@ export default function OrderDetails() {
   const rowMarkup = order.lineItems.map(
     ({ node }: any, index: number) => {
         const refundQty = refundState[node.id] || 0;
-        const maxQty = node.quantity;
-        
+        const maxQty = node.refundableQuantity; // Use Refundable Qty, not Total
+        const isFullyRefunded = maxQty === 0;
+
         return (
             <IndexTable.Row id={node.id} key={node.id} position={index}>
                 <IndexTable.Cell>
@@ -201,7 +371,15 @@ export default function OrderDetails() {
                 {node.variant?.price} {order.currencyCode}
                 </IndexTable.Cell>
                 <IndexTable.Cell>
-                    {node.quantity}
+                    <BlockStack>
+                         <Text as="span">{node.quantity}</Text>
+                         {!isFullyRefunded && node.quantity !== maxQty && (
+                             <Text as="span" tone="subdued" variant="bodySm">({maxQty} refundable)</Text>
+                         )}
+                         {isFullyRefunded && (
+                             <Badge tone="info">Refunded</Badge>
+                         )}
+                    </BlockStack>
                 </IndexTable.Cell>
                 <IndexTable.Cell>
                     <div style={{ maxWidth: "100px" }}>
@@ -213,6 +391,7 @@ export default function OrderDetails() {
                             onChange={(val) => handleQuantityChange(node.id, val, maxQty)}
                             min={0}
                             max={maxQty}
+                            disabled={isFullyRefunded}
                             autoComplete="off"
                         />
                     </div>
@@ -301,6 +480,18 @@ export default function OrderDetails() {
                         <Text as="p" variant="bodyMd">
                             Financial: <Badge tone={order.displayFinancialStatus === 'PAID' ? 'success' : 'info'}>{order.displayFinancialStatus}</Badge>
                         </Text>
+                        
+                        {/* Status Message */}
+                        {actionData?.status === "success" && (
+                            <Banner tone="success" title="Refund Successful">
+                                <p>{actionData.message}</p>
+                            </Banner>
+                        )}
+                        {actionData?.status === "error" && (
+                             <Banner tone="critical" title="Refund Failed">
+                                <p>{actionData.message}</p>
+                            </Banner>
+                        )}
                          <Text as="p" variant="bodyMd" tone="subdued">
                             Total Order Value: {formattedTotal}
                         </Text>
@@ -315,9 +506,10 @@ export default function OrderDetails() {
         onClose={() => setModalOpen(false)}
         title="Preview Refund"
         primaryAction={{
-            content: "Create Refund (Coming Soon)",
-            onAction: () => setModalOpen(false), 
-            disabled: true 
+            content: isLoading ? "Processing..." : "Confirm Refund",
+            onAction: handleRefundSubmit, 
+            disabled: isLoading,
+            destructive: true // Refund is a destructive action (money out)
         }}
         secondaryActions={[
             {
@@ -351,6 +543,15 @@ export default function OrderDetails() {
                     <Text as="span" fontWeight="bold">Total Refund</Text>
                      <Text as="span" fontWeight="bold">{new Intl.NumberFormat('en-US', { style: 'currency', currency: order.currencyCode }).format(calculatedRefundTotal)}</Text>
                 </InlineStack>
+
+                <TextField
+                    label="Reason for refund (optional)"
+                    value={refundNote}
+                    onChange={(value) => setRefundNote(value)}
+                    multiline={3}
+                    autoComplete="off"
+                    placeholder="e.g. Customer returned damaged item..."
+                />
             </BlockStack>
         </Modal.Section>
       </Modal>
